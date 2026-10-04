@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OSU P-card audit</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.11.0/sql-wasm.js"></script>
+  <style>
+    :root { color-scheme: light; }
+    body { margin: 0; font-family: Georgia, "Times New Roman", serif; background: #f3efe6; color: #1a1814; }
+    main { max-width: 1100px; margin: 0 auto; padding: 28px 16px 48px; }
+    h1 { font-size: 2.2rem; margin: 0 0 8px; }
+    p { line-height: 1.5; }
+    .muted { color: #6d655c; }
+    .tabs { display: flex; gap: 8px; margin: 18px 0; }
+    button, select, input, textarea { font: inherit; }
+    button { min-height: 44px; border: 0; border-radius: 999px; padding: 0 16px; background: #fffdf8; cursor: pointer; }
+    button.active, button.primary { background: #9c3b1c; color: #fff7f2; }
+    .card { background: #fffdf8; border: 1px solid #ddd4c4; border-radius: 16px; padding: 16px; margin-bottom: 16px; }
+    label { display: block; font-size: 0.95rem; margin-top: 10px; }
+    input, select, textarea { width: 100%; box-sizing: border-box; min-height: 44px; margin-top: 4px; padding: 8px 10px; border: 1px solid #ddd4c4; border-radius: 8px; background: #f3efe6; }
+    textarea { min-height: 90px; }
+    .grid { display: grid; gap: 16px; }
+    @media (min-width: 800px) { .grid { grid-template-columns: 1fr 1fr; } }
+    table { width: 100%; border-collapse: collapse; font-family: Arial, sans-serif; font-size: 14px; }
+    th, td { border-top: 1px solid #ddd4c4; text-align: left; padding: 8px; vertical-align: top; }
+    th { color: #6d655c; }
+    .wrap { overflow-x: auto; }
+    .error { color: #9c3b1c; }
+    #status { font-family: Arial, sans-serif; }
+  </style>
+</head>
+<body>
+  <main>
+    <p class="muted">Internal audit</p>
+    <h1>OSU P-card review</h1>
+    <p class="muted">A match is a lead for follow-up, not proof of a violation.</p>
+    <p id="status">Loading the database. The first visit can take a minute.</p>
+    <div class="tabs">
+      <button id="tab-dash" class="active" type="button">Prohibited purchases</button>
+      <button id="tab-ask" type="button">Ask in plain language</button>
+    </div>
+
+    <section id="panel-dash">
+      <div class="card">
+        <h2>How to use this dashboard</h2>
+        <ol>
+          <li>Choose the year. Use 2014 for the assignment.</li>
+          <li>Description search checks only the description. Examples: alcohol, gift card, donation, membership, insurance, late fee, moving.</li>
+          <li>Vendor search checks only the merchant. Examples: liquor, postal, shell, florist.</li>
+          <li>Review the amount, employee, vendor, date, and merchant category before deciding there was a violation.</li>
+        </ol>
+        <p>Prohibited areas include alcohol, cash and ATM, decorations, donations and sponsorships, gasoline, gifts and gift cards, insurance, late fees, mail and postage, moving expenses, personal purchases, personal memberships, salaries and benefits, and service or incentive awards.</p>
+        <label for="year">Year</label>
+        <select id="year"></select>
+      </div>
+      <div class="grid">
+        <form class="card" id="form-desc">
+          <h2>Description search</h2>
+          <label for="desc">Keyword</label>
+          <input id="desc" value="alcohol" />
+          <button class="primary" type="submit">Search descriptions</button>
+        </form>
+        <form class="card" id="form-vendor">
+          <h2>Vendor search</h2>
+          <label for="vendor">Keyword</label>
+          <input id="vendor" value="postal" />
+          <button class="primary" type="submit">Search vendors</button>
+        </form>
+      </div>
+      <div id="dash-result"></div>
+    </section>
+
+    <section id="panel-ask" hidden>
+      <form class="card" id="form-ask">
+        <h2>Ask a question</h2>
+        <p class="muted">No API key is needed. Examples: employees who spent more than 50000 in 2014. Transactions over 5000 in 2014. Purchases mentioning alcohol in 2014. Purchases from shell in 2014.</p>
+        <label for="question">Question</label>
+        <textarea id="question">Which employees spent more than 50000 in 2014? Show name and total.</textarea>
+        <button class="primary" type="submit">Ask</button>
+      </form>
+      <div id="ask-result"></div>
+    </section>
+  </main>
+  <script>
+    let database = null;
+    const status = document.getElementById("status");
+
+    function show(name) {
+      document.getElementById("panel-dash").hidden = name !== "dash";
+      document.getElementById("panel-ask").hidden = name !== "ask";
+      document.getElementById("tab-dash").classList.toggle("active", name === "dash");
+      document.getElementById("tab-ask").classList.toggle("active", name === "ask");
+    }
+    document.getElementById("tab-dash").onclick = () => show("dash");
+    document.getElementById("tab-ask").onclick = () => show("ask");
+
+    function table(columns, rows) {
+      if (!rows.length) return "<p>No matching rows.</p>";
+      const head = columns.map((column) => `<th>${column}</th>`).join("");
+      const body = rows.map((row) => `<tr>${row.map((cell) => `<td>${cell ?? ""}</td>`).join("")}</tr>`).join("");
+      return `<div class="card wrap"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+    }
+
+    function query(sql, params) {
+      const statement = database.prepare(sql);
+      statement.bind(params);
+      const columns = statement.getColumnNames();
+      const rows = [];
+      while (statement.step()) rows.push(statement.get());
+      statement.free();
+      return { columns, rows };
+    }
+
+    function keywordFrom(text, stop) {
+      const words = text.match(/[a-z]{4,}/g) || [];
+      return words.find((word) => !stop.includes(word)) || "";
+    }
+
+    document.getElementById("form-ask").onsubmit = (event) => {
+      event.preventDefault();
+      const box = document.getElementById("ask-result");
+      const text = document.getElementById("question").value.toLowerCase();
+      const yearMatch = text.match(/20(1[0-4])/);
+      const year = yearMatch ? Number(yearMatch[0]) : 2014;
+      const amountMatch = text.replace(/,/g, "").match(/(\d{3,})/);
+      const amount = amountMatch ? Number(amountMatch[1]) : 5000;
+      try {
+        let sql;
+        let params;
+        if (text.includes("more than") || text.includes("greater than") || text.includes("over")) {
+          if (text.includes("employee") || text.includes("who") || text.includes("spent")) {
+            sql = `SELECT FullName, ROUND(SUM(Amount), 2) AS TotalSpent FROM pcards WHERE Year = ? AND Amount > 0 GROUP BY FullName HAVING SUM(Amount) > ? ORDER BY TotalSpent DESC LIMIT 100`;
+            params = [year, amount];
+          } else {
+            sql = `SELECT Amount, FullName, Vendor, Description, TransactionDate, MCC FROM pcards WHERE Year = ? AND Amount > ? ORDER BY Amount DESC LIMIT 100`;
+            params = [year, amount];
+          }
+        } else if (text.includes("vendor") || text.includes("merchant")) {
+          const keyword = keywordFrom(text, ["vendor", "merchant", "which", "what", "from", "with", "that", "this", "show", "find", "purchases", "purchase", "transactions", "year"]);
+          if (!keyword) throw new Error("Name the vendor, for example: purchases from shell in 2014.");
+          sql = `SELECT Amount, FullName, Vendor, Description, TransactionDate, MCC FROM pcards WHERE Year = ? AND LOWER(Vendor) LIKE '%' || ? || '%' ORDER BY Amount DESC LIMIT 100`;
+          params = [year, keyword];
+        } else {
+          const keyword = keywordFrom(text, ["which", "what", "from", "with", "that", "this", "show", "find", "purchases", "purchase", "transactions", "description", "about", "year", "mentioning"]);
+          if (!keyword) throw new Error("Try: employees who spent more than 50000 in 2014. Or: purchases mentioning alcohol in 2014.");
+          sql = `SELECT Amount, FullName, Vendor, Description, TransactionDate, MCC FROM pcards WHERE Year = ? AND (LOWER(Description) LIKE '%' || ? || '%' OR LOWER(MCC) LIKE '%' || ? || '%') ORDER BY Amount DESC LIMIT 100`;
+          params = [year, keyword, keyword];
+        }
+        const result = query(sql, params);
+        box.innerHTML = `<pre class="card">${sql}</pre>` + table(result.columns, result.rows);
+      } catch (error) {
+        box.innerHTML = `<p class="error">${error.message}</p>`;
+      }
+    };
+    async function loadDatabase() {
+      const SQL = await initSqlJs({ locateFile: (file) => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.11.0/${file}` });
+      const response = await fetch("pcards.db.gz");
+      if (!response.ok) throw new Error("Could not download pcards.db.gz. Upload it to this same repository.");
+      const stream = response.body.pipeThrough(new DecompressionStream("gzip"));
+      const bytes = new Uint8Array(await new Response(stream).arrayBuffer());
+      database = new SQL.Database(bytes);
+      const years = query("SELECT DISTINCT Year FROM pcards ORDER BY Year", []);
+      const select = document.getElementById("year");
+      years.rows.forEach((row) => {
+        const option = document.createElement("option");
+        option.value = row[0];
+        option.textContent = row[0];
+        if (row[0] === 2014) option.selected = true;
+        select.appendChild(option);
+      });
+      status.textContent = "Database ready.";
+    }
+
+    function runSearch(field) {
+      const keyword = document.getElementById(field === "Description" ? "desc" : "vendor").value.trim();
+      const year = Number(document.getElementById("year").value);
+      if (keyword.length < 2) {
+        document.getElementById("dash-result").innerHTML = `<p class="error">Enter at least 2 characters.</p>`;
+        return;
+      }
+      const result = query(
+        `SELECT Amount, FullName, Vendor, Description, TransactionDate, MCC
+         FROM pcards
+         WHERE Year = ? AND LOWER(${field}) LIKE '%' || LOWER(?) || '%'
+         ORDER BY Amount DESC LIMIT 200`,
+        [year, keyword]
+      );
+      document.getElementById("dash-result").innerHTML =
+        `<h2>${result.rows.length} matches</h2>` + table(result.columns, result.rows);
+    }
+
+    document.getElementById("form-desc").onsubmit = (event) => { event.preventDefault(); runSearch("Description"); };
+    document.getElementById("form-vendor").onsubmit = (event) => { event.preventDefault(); runSearch("Vendor"); };
+
+    loadDatabase().catch((error) => { status.textContent = error.message; });
+  </script>
+</body>
+</html>
