@@ -1,4 +1,4 @@
-import json
+import re
 import sqlite3
 import urllib.request
 from pathlib import Path
@@ -33,51 +33,63 @@ def search(year, field, keyword):
     """
     return pd.read_sql_query(query, get_connection(), params=(int(year), keyword.strip()))
 
-def safe_select(sql):
-    text = sql.strip().strip("`")
-    if text.lower().startswith("sql"):
-        text = text[3:].strip()
-    text = text.rstrip(";").strip()
-    lowered = text.lower()
-    if not lowered.startswith("select") or ";" in text:
-        raise ValueError("Only one SELECT query is allowed.")
-    banned = ("insert", "update", "delete", "drop", "alter", "attach", "pragma", "create")
-    if any(word in lowered for word in banned):
-        raise ValueError("That query is not allowed.")
-    if "pcards" not in lowered:
-        raise ValueError("The query must use the pcards table.")
-    return f"SELECT * FROM ({text}) AS audit_q LIMIT 100"
-
 def ask_question(question):
-    api_key = st.secrets.get("XAI_API_KEY", "")
-    if not api_key:
-        raise ValueError("Add XAI_API_KEY in the host secrets. Do not put it in this file.")
-    prompt = (
-        "Write one SQLite SELECT for table pcards. Reply with SQL only. "
-        "Columns: Year, Month, FullName, Description, Amount, Vendor, "
-        "TransactionDate, PostedDate, MCC, CardholderLastName, CardholderFirstInitial. "
-        "Dates look like 7/26/2014 0:00:00. Use Year = 2014 unless another year from 2010 to 2014 is named. "
-        "Include LIMIT 100."
-    )
-    body = json.dumps({
-        "model": "grok-4.5",
-        "temperature": 0,
-        "max_tokens": 350,
-        "messages": [
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": question},
-        ],
-    }).encode()
-    request = urllib.request.Request(
-        "https://api.x.ai/v1/chat/completions",
-        data=body,
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
-    )
-    with urllib.request.urlopen(request, timeout=60) as response:
-        payload = json.loads(response.read().decode())
-    raw = payload["choices"][0]["message"]["content"]
-    sql = safe_select(raw)
-    return sql, pd.read_sql_query(sql, get_connection())
+    text = question.lower()
+    year_match = re.search(r"20(1[0-4])", text)
+    year = int(year_match.group(0)) if year_match else 2014
+    amount_match = re.search(r"(\d{3,})", text.replace(",", ""))
+    amount = float(amount_match.group(1)) if amount_match else 5000
+
+    if "more than" in text or "greater than" in text or "over" in text:
+        if "employee" in text or "who" in text or "spent" in text:
+            sql = """
+                SELECT FullName, ROUND(SUM(Amount), 2) AS TotalSpent
+                FROM pcards
+                WHERE Year = ? AND Amount > 0
+                GROUP BY FullName
+                HAVING SUM(Amount) > ?
+                ORDER BY TotalSpent DESC
+                LIMIT 100
+            """
+            return sql, pd.read_sql_query(sql, get_connection(), params=(year, amount))
+        sql = """
+            SELECT Amount, FullName, Vendor, Description, TransactionDate, MCC
+            FROM pcards
+            WHERE Year = ? AND Amount > ?
+            ORDER BY Amount DESC
+            LIMIT 100
+        """
+        return sql, pd.read_sql_query(sql, get_connection(), params=(year, amount))
+
+    if "vendor" in text or "merchant" in text:
+        words = re.findall(r"[a-z]{4,}", text)
+        stop = {"vendor", "merchant", "which", "what", "from", "with", "that", "this", "show", "find", "purchases", "purchase", "transactions", "year"}
+        keyword = next((word for word in words if word not in stop), "")
+        if not keyword:
+            raise ValueError("Name the vendor, for example: purchases from shell in 2014.")
+        sql = """
+            SELECT Amount, FullName, Vendor, Description, TransactionDate, MCC
+            FROM pcards
+            WHERE Year = ? AND LOWER(Vendor) LIKE '%' || ? || '%'
+            ORDER BY Amount DESC
+            LIMIT 100
+        """
+        return sql, pd.read_sql_query(sql, get_connection(), params=(year, keyword))
+
+    words = re.findall(r"[a-z]{4,}", text)
+    stop = {"which", "what", "from", "with", "that", "this", "show", "find", "purchases", "purchase", "transactions", "description", "about", "year"}
+    keyword = next((word for word in words if word not in stop), "")
+    if not keyword:
+        raise ValueError("Try: employees who spent more than 50000 in 2014. Or: purchases mentioning alcohol in 2014.")
+    sql = """
+        SELECT Amount, FullName, Vendor, Description, TransactionDate, MCC
+        FROM pcards
+        WHERE Year = ?
+          AND (LOWER(Description) LIKE '%' || ? || '%' OR LOWER(MCC) LIKE '%' || ? || '%')
+        ORDER BY Amount DESC
+        LIMIT 100
+    """
+    return sql, pd.read_sql_query(sql, get_connection(), params=(year, keyword, keyword))
 
 st.title("OSU P-card review")
 st.caption("A match is a lead for follow-up, not proof of a violation.")
@@ -96,7 +108,6 @@ with dashboard_tab:
     years = pd.read_sql_query("SELECT DISTINCT Year FROM pcards ORDER BY Year", get_connection())
     year_list = years["Year"].tolist()
     year = st.selectbox("Year", year_list, index=year_list.index(2014) if 2014 in year_list else 0)
-
     left, right = st.columns(2)
     with left:
         st.subheader("Description search")
@@ -115,8 +126,8 @@ with dashboard_tab:
 
 with ask_tab:
     st.subheader("Ask a question")
-    st.write("The question is turned into a read-only query. At most 100 rows are shown. Check the SQL before relying on it.")
-    question = st.text_area("Question", "Which employees spent more than 50000 in 2014? Show name and total.")
+    st.write("Examples: employees who spent more than 50000 in 2014. Transactions over 5000 in 2014. Purchases mentioning alcohol in 2014. Purchases from shell in 2014.")
+    question = st.text_area("Question", "Which employees spent more than 50000 in 2014?")
     if st.button("Ask"):
         try:
             sql, rows = ask_question(question)
